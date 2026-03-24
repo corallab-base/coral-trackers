@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+import rclpy, cv2, numpy as np
+from rclpy.node import Node
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PointStamped, PoseStamped
+from visualization_msgs.msg import Marker
+from cv_bridge import CvBridge
+
+
+DEPTH_K = 5  # odd number (pixels)
+
+# BGR colors for OpenCV
+COLOR_BGR = {
+    "red":    (0,   0, 255),
+    "green":  (0, 255,   0),
+    "blue":   (255, 0,   0),
+    "yellow": (0, 255, 255),
+    "cyan":   (255,255,  0),
+    "magenta":(255, 0, 255),
+    "orange": (0, 165, 255),
+    "purple": (128, 0, 128),
+}
+
+def _to_mask_u8(mask):
+    """Return a single-channel uint8 mask in {0,255} with shape (H,W)."""
+    m = mask
+    if m.ndim == 3:  # if provided as (H,W,1)
+        m = m[..., 0]
+    if m.dtype != np.uint8:
+        m = m.astype(np.uint8)
+    # normalize to {0,255}
+    if m.max() <= 1:
+        m = (m > 0).astype(np.uint8) * 255
+    return m
+
+def _largest_component_u8(mask_u8: np.ndarray, min_area: int = 50) -> np.ndarray:
+    """
+    Keep only the largest connected component (> min_area px) from a uint8 mask.
+    Returns a uint8 mask with values in {0,255}.
+    """
+    if mask_u8 is None or mask_u8.size == 0:
+        return np.zeros((0, 0), np.uint8)
+    m = (mask_u8 > 0).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if num <= 1:
+        return np.zeros_like(m, dtype=np.uint8)
+    # labels: 0 is background; choose argmax area among [1..num-1]
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    idx = int(np.argmax(areas)) + 1
+    if areas[idx - 1] < min_area:
+        return np.zeros_like(m, dtype=np.uint8)
+    kept = (labels == idx).astype(np.uint8) * 255
+    return kept
+
+def _mean_xyz_from_mask(mask_u8: np.ndarray, depth_m: np.ndarray, K) -> np.ndarray | None:
+    """
+    Compute mean 3D point (X,Y,Z) of all mask pixels using per-pixel depth and intrinsics K=(fx,fy,cx,cy).
+    Returns (3,) float32 in camera frame, or None if insufficient valid depth.
+    """
+    fx, fy, cx, cy = K
+    ys, xs = np.where(mask_u8 > 0)
+    if ys.size == 0:
+        return None
+    zs = depth_m[ys, xs].astype(np.float32)
+    valid = np.isfinite(zs) & (zs > 0)
+    if not np.any(valid):
+        return None
+    xs = xs[valid].astype(np.float32)
+    ys = ys[valid].astype(np.float32)
+    zs = zs[valid]
+    Xs = (xs - cx) * zs / fx
+    Ys = (ys - cy) * zs / fy
+    # Optionally subsample for speed if huge:
+    # if Xs.size > 20000: idx = np.random.choice(Xs.size, 20000, replace=False); Xs, Ys, zs = Xs[idx], Ys[idx], zs[idx]
+    X = np.mean(Xs)
+    Y = np.mean(Ys)
+    Z = np.mean(zs)
+    return np.array([X, Y, Z], dtype=np.float32)
+
+def robust_depth_at_pixel(depth_m: np.ndarray, u: float, v: float, k: int = 5) -> float:
+    """Median depth in a kxk window around (u, v). Returns 0.0 if none valid."""
+    if depth_m is None:
+        return 0.0
+    h, w = depth_m.shape[:2]
+    ui, vi = int(round(u)), int(round(v))
+    x0 = max(0, ui - k // 2); x1 = min(w, ui + k // 2 + 1)
+    y0 = max(0, vi - k // 2); y1 = min(h, vi + k // 2 + 1)
+    patch = depth_m[y0:y1, x0:x1]
+    vals = patch[patch > 0.0]
+    if vals.size == 0:
+        return 0.0
+    return float(np.median(vals))
+
+class ColorsTracker(Node):
+    def __init__(self):
+        super().__init__('colors_tracker')
+        self.bridge = CvBridge()
+        self.sub_img   = self.create_subscription(Image, 'image', self.on_img, 10)
+        self.sub_info  = self.create_subscription(CameraInfo, 'camera_info', self.on_info, 10)
+        self.sub_depth = self.create_subscription(Image, 'depth', self.on_depth, 10)
+
+        # HSV ranges per color (tune these!)
+        # Format: (lower HSV), (upper HSV); H in [0,180] for OpenCV HSV.
+        self.color_ranges = {
+            "yellow": ((21, 84, 168), (38, 255, 255)),
+            "blue": ((95, 170, 80), (115, 255, 255)),
+            "red": ((0, 121, 175), (18, 255, 255)),
+            "green": ((39, 90, 87), (57, 255, 255)),
+            "purple": ((109, 71, 98), (180, 255, 255)),
+        }
+
+        self.center_publishers = {
+            k: self.create_publisher(PointStamped, f'{k}/center', 10)
+            for k in self.color_ranges.keys()
+        }
+
+        self.centroid_publishers = {
+            k: self.create_publisher(PointStamped, f'{k}/centroid', 10)
+            for k in self.color_ranges.keys()
+        }
+
+        self.projected_centroid_publishers = {
+            k: self.create_publisher(PointStamped, f'{k}/projected_centroid', 10)
+            for k in self.color_ranges.keys()
+        }
+
+        self.mask_publishers = {
+            k: self.create_publisher(Image, f'{k}/mask', 10)
+            for k in self.color_ranges.keys()
+        }
+
+        # # Create one slider window for each color
+        # for cname, (lo, hi) in self.color_ranges.items():
+        #     win = f"{cname}_sliders"
+        #     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        #     cv2.createTrackbar("H_low",  win, lo[0], 180, lambda x: None)
+        #     cv2.createTrackbar("S_low",  win, lo[1], 255, lambda x: None)
+        #     cv2.createTrackbar("V_low",  win, lo[2], 255, lambda x: None)
+        #     cv2.createTrackbar("H_high", win, hi[0], 180, lambda x: None)
+        #     cv2.createTrackbar("S_high", win, hi[1], 255, lambda x: None)
+        #     cv2.createTrackbar("V_high", win, hi[2], 255, lambda x: None)
+
+        self.K = None    # (fx, fy, cx, cy)
+        self.img = None  # last BGR
+        self.depth = None # last depth meters
+        self.fx = self.fy = self.cx = self.cy = None
+
+        self.masks = None
+        self.mask_all = None
+
+        # UI
+        self.window="colors"
+        cv2.namedWindow(self.window, cv2.WINDOW_NORMAL)
+
+        self.timer = self.create_timer(0.05, self.render)
+
+    def on_info(self, msg: CameraInfo):
+        self.K = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])  # fx, fy, cx, cy
+        self.fx = float(msg.k[0])
+        self.fy = float(msg.k[4])
+        self.cx = float(msg.k[2])
+        self.cy = float(msg.k[5])
+
+    def on_depth(self, msg: Image):
+        d = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        if d.dtype == np.uint16:
+            depth_m = d.astype(np.float32) / 1000.0
+        else:
+            depth_m = d.astype(np.float32)
+        self.depth = depth_m
+
+    def on_img(self, msg: Image):
+        if self.K is None or self.depth is None:
+            return
+
+        bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        self.img = bgr
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+        H, W = hsv.shape[:2]
+        depth_m = self.depth
+        if depth_m.shape[:2] != (H, W):
+            # Depth/rgb not aligned or missing; skip this frame cleanly.
+            self.get_logger().warn("Depth/RGB size mismatch; skipping frame")
+            return
+
+        # Broad Z gate (tighten as needed for your table range)
+        zmin, zmax = 0.05, 2.0
+        depth_gate = (depth_m > zmin) & (depth_m < zmax)
+
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+        masks = {}
+        centers_xyz = {}
+
+        for name, (lo, hi) in self.color_ranges.items():
+            # Initial color threshold
+            m = cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8))
+
+            # Clean with morphology
+            m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k, iterations=1)
+            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=1)
+
+            # Depth gate
+            m = (m > 0).astype(np.uint8) & depth_gate.astype(np.uint8)
+            m *= 255  # back to {0,255}
+
+            # Keep only largest island / blob
+            m = _largest_component_u8(m, min_area=80)
+
+            masks[name] = m
+
+            # Compute 3D center of that blob & publish
+            if cv2.countNonZero(m) > 0:
+
+                # For Centroid
+                M = cv2.moments(m)
+                if M["m00"] > 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+
+                    pt2d = PointStamped()
+                    pt2d.header = msg.header
+                    pt2d.point.x, pt2d.point.y = float(cx), float(cy)
+                    self.centroid_publishers[name].publish(pt2d)
+
+                    # For Projected Centroid
+                    z = robust_depth_at_pixel(depth_m, cx, cy, k=DEPTH_K)
+                    if z > 0 and np.isfinite(z):
+                        X = (cx - self.cx) / self.fx * z
+                        Y = (cy - self.cy) / self.fy * z
+                        pt3d = PointStamped()
+                        pt3d.header = msg.header
+                        pt3d.point.x, pt3d.point.y, pt3d.point.z = float(X), float(Y), float(z)
+                        self.projected_centroid_publishers[name].publish(pt3d)
+
+                # For 3d center in camera frame
+                center_xyz = _mean_xyz_from_mask(m, depth_m, self.K)
+                if center_xyz is not None:
+                    centers_xyz[name] = center_xyz
+                    pt = PointStamped()
+                    pt.header = msg.header
+                    # Use the RGB optical frame (or whatever your image frame is)
+                    if not pt.header.frame_id:
+                        pt.header.frame_id = 'camera_color_optical_frame'
+                    pt.point.x = float(center_xyz[0])
+                    pt.point.y = float(center_xyz[1])
+                    pt.point.z = float(center_xyz[2])
+                    self.center_publishers[name].publish(pt)
+                else:
+                    self.get_logger().debug(f"No valid depth for {name} blob")
+
+                # publish mask
+                mask_msg = self.bridge.cv2_to_imgmsg(m, 'mono8')
+                mask_msg.header = msg.header
+                self.mask_publishers[name].publish(mask_msg)
+
+            # else: no blob for this color
+
+        # Stash filtered masks for visualization
+        self.masks = masks
+        self.mask_all = None
+
+    # ---- UI loop & key handling ----
+    def render(self):
+        if not getattr(self, "masks", None) or len(self.masks) == 0:
+            self.get_logger().info("masks is still none or empty")
+            return
+
+        # Determine canvas size from the first mask
+        first_mask = next(iter(self.masks.values()))
+        m0 = _to_mask_u8(first_mask)
+        H, W = m0.shape[:2]
+
+        base = getattr(self, "img", None)
+        if base is None or base.shape[:2] != (H, W):
+            base = np.zeros((H, W, 3), dtype=np.uint8)
+
+        # Build a colored canvas of all masks
+        color_canvas = np.zeros_like(base)
+        for name, mask in self.masks.items():
+            m = _to_mask_u8(mask)
+            color = COLOR_BGR.get(name.lower(), (200, 200, 200))
+            # paint mask pixels with this color
+            color_canvas[m > 0] = color
+
+        # Overlay colored masks on the base image
+        alpha = 0.6
+        vis = cv2.addWeighted(base, 1.0, color_canvas, alpha, 0)
+
+        # Draw contours + labels for each mask
+        for name, mask in self.masks.items():
+            m = _to_mask_u8(mask)
+            if cv2.countNonZero(m) == 0:
+                continue
+            color = COLOR_BGR.get(name.lower(), (200, 200, 200))
+            cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(vis, cnts, -1, color, 2)
+
+            # Label near the largest contour
+            areas = [cv2.contourArea(c) for c in cnts]
+            if areas:
+                c = cnts[int(np.argmax(areas))]
+                x, y, w, h = cv2.boundingRect(c)
+                px = cv2.countNonZero(m)
+                cv2.putText(
+                    vis, f"{name} ({px} px)", (x, max(15, y-5)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA
+                )
+
+        # Optional legend
+        y0 = 18
+        for i, (name, color) in enumerate(COLOR_BGR.items()):
+            cv2.rectangle(vis, (10, y0 + 22*i - 12), (30, y0 + 22*i + 8), color, -1)
+            cv2.putText(vis, name, (36, y0 + 22*i), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230,230,230), 1, cv2.LINE_AA)
+
+        cv2.imshow(self.window, vis)
+        key = cv2.waitKey(1) & 0xFF
+
+def main():
+    rclpy.init()
+    n = ColorsTracker()
+    rclpy.spin(n)
+    n.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == "__main__":
+    main()
