@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'ros2-realtime-object-tracking'
+package_name = 'coral_trackers'
 
 setup(
     name=package_name,
