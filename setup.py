@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'colors_tracker = coral_trackers.colors_tracker:main',
         ],
     },
 )
