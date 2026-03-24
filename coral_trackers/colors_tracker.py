@@ -129,16 +129,21 @@ class ColorsTracker(Node):
             for k in self.color_ranges.keys()
         }
 
-        # # Create one slider window for each color
-        # for cname, (lo, hi) in self.color_ranges.items():
-        #     win = f"{cname}_sliders"
-        #     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-        #     cv2.createTrackbar("H_low",  win, lo[0], 180, lambda x: None)
-        #     cv2.createTrackbar("S_low",  win, lo[1], 255, lambda x: None)
-        #     cv2.createTrackbar("V_low",  win, lo[2], 255, lambda x: None)
-        #     cv2.createTrackbar("H_high", win, hi[0], 180, lambda x: None)
-        #     cv2.createTrackbar("S_high", win, hi[1], 255, lambda x: None)
-        #     cv2.createTrackbar("V_high", win, hi[2], 255, lambda x: None)
+        def thresh_setter(cname, lo_or_hi_idx, hsv_idx):
+            def f(x):
+                self.color_ranges[cname][lo_or_hi_idx][hsv_idx] = x
+            return f
+
+        # Create one slider window for each color
+        for cname, (lo, hi) in self.color_ranges.items():
+            win = f"{cname}_sliders"
+            cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+            cv2.createTrackbar("H_low",  win, lo[0], 180, thresh_setter(cname, 0, 0))
+            cv2.createTrackbar("S_low",  win, lo[1], 255, thresh_setter(cname, 0, 1))
+            cv2.createTrackbar("V_low",  win, lo[2], 255, thresh_setter(cname, 0, 2))
+            cv2.createTrackbar("H_high", win, hi[0], 180, thresh_setter(cname, 1, 0))
+            cv2.createTrackbar("S_high", win, hi[1], 255, thresh_setter(cname, 1, 1))
+            cv2.createTrackbar("V_high", win, hi[2], 255, thresh_setter(cname, 1, 2))
 
         self.K = None    # (fx, fy, cx, cy)
         self.img = None  # last BGR
@@ -152,7 +157,71 @@ class ColorsTracker(Node):
         self.window="colors"
         cv2.namedWindow(self.window, cv2.WINDOW_NORMAL)
 
+        # Mouse selection state
+        self.active_color = list(self.color_ranges.keys())[0] # Default active color
+        self.hsv_img = None
+        self.drag_start = None
+        self.drag_end = None
+        self.is_dragging = False
+        cv2.setMouseCallback(self.window, self.on_mouse)
+
         self.timer = self.create_timer(0.05, self.render)
+
+    def on_mouse(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.drag_start = (x, y)
+            self.drag_end = (x, y)
+            self.is_dragging = True
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if self.is_dragging:
+                self.drag_end = (x, y)
+        elif event == cv2.EVENT_LBUTTONUP:
+            self.is_dragging = False
+            self.drag_end = (x, y)
+            self.update_hsv_from_patch()
+
+    def update_hsv_from_patch(self):
+        if self.hsv_img is None or self.drag_start is None or self.drag_end is None:
+            return
+
+        x1, y1 = self.drag_start
+        x2, y2 = self.drag_end
+
+        x_min, x_max = min(x1, x2), max(x1, x2)
+        y_min, y_max = min(y1, y2), max(y1, y2)
+
+        # If it's just a single click (or tiny box), expand it to a 5x5 patch
+        if x_max - x_min < 2 or y_max - y_min < 2:
+            x_min, x_max = max(0, x1 - 2), min(self.hsv_img.shape[1], x1 + 3)
+            y_min, y_max = max(0, y1 - 2), min(self.hsv_img.shape[0], y1 + 3)
+
+        patch = self.hsv_img[y_min:y_max, x_min:x_max]
+        if patch.size == 0:
+            return
+
+        # Calculate min and max HSV in the patch
+        min_hsv = np.min(patch, axis=(0, 1))
+        max_hsv = np.max(patch, axis=(0, 1))
+
+        # Add a buffer so the threshold isn't uncomfortably tight
+        buffer = np.array([5, 30, 30])
+        min_hsv = np.maximum(min_hsv - buffer, 0).astype(int)
+        max_hsv = np.minimum(max_hsv + buffer, [180, 255, 255]).astype(int)
+
+        cname = self.active_color
+
+        # Update the UI Trackbars (This will automatically trigger thresh_setter)
+        win = f"{cname}_sliders"
+        try:
+            cv2.setTrackbarPos("H_low", win, int(min_hsv[0]))
+            cv2.setTrackbarPos("S_low", win, int(min_hsv[1]))
+            cv2.setTrackbarPos("V_low", win, int(min_hsv[2]))
+            cv2.setTrackbarPos("H_high", win, int(max_hsv[0]))
+            cv2.setTrackbarPos("S_high", win, int(max_hsv[1]))
+            cv2.setTrackbarPos("V_high", win, int(max_hsv[2]))
+            self.get_logger().info(f"Sampled patch! Updated '{cname}' HSV thresholds.")
+        except cv2.error:
+            self.get_logger().warn(f"Could not update trackbars. Is the {win} window closed?")
 
     def on_info(self, msg: CameraInfo):
         self.K = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])  # fx, fy, cx, cy
@@ -176,6 +245,9 @@ class ColorsTracker(Node):
         bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         self.img = bgr
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+        # Save HSV for mouse sampling
+        self.hsv_img = hsv.copy()
 
         H, W = hsv.shape[:2]
         depth_m = self.depth
@@ -212,7 +284,6 @@ class ColorsTracker(Node):
 
             # Compute 3D center of that blob & publish
             if cv2.countNonZero(m) > 0:
-
                 # For Centroid
                 M = cv2.moments(m)
                 if M["m00"] > 0:
@@ -291,6 +362,7 @@ class ColorsTracker(Node):
         # Draw contours + labels for each mask
         for name, mask in self.masks.items():
             m = _to_mask_u8(mask)
+
             if cv2.countNonZero(m) == 0:
                 continue
             color = COLOR_BGR.get(name.lower(), (200, 200, 200))
@@ -314,8 +386,22 @@ class ColorsTracker(Node):
             cv2.rectangle(vis, (10, y0 + 22*i - 12), (30, y0 + 22*i + 8), color, -1)
             cv2.putText(vis, name, (36, y0 + 22*i), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230,230,230), 1, cv2.LINE_AA)
 
+        # Draw dragging rectangle
+        if self.is_dragging and self.drag_start and self.drag_end:
+            cv2.rectangle(vis, self.drag_start, self.drag_end, (255, 255, 255), 2)
+
+        # Show active tuning color instructions
+        msg_text = f"Active: {self.active_color} (Press 'c' to cycle colors)"
+        cv2.putText(vis, msg_text, (10, H - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
         cv2.imshow(self.window, vis)
         key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('c'):
+            colors = list(self.color_ranges.keys())
+            idx = colors.index(self.active_color)
+            self.active_color = colors[(idx + 1) % len(colors)]
+            self.get_logger().info(f"Switched active tuning color to: {self.active_color}")
 
 def main():
     rclpy.init()
