@@ -199,26 +199,47 @@ class ColorsTracker(Node):
         if patch.size == 0:
             return
 
-        # Calculate min and max HSV in the patch
-        min_hsv = np.min(patch, axis=(0, 1))
-        max_hsv = np.max(patch, axis=(0, 1))
+        # Separate channels
+        H_patch = patch[:, :, 0]
+        S_patch = patch[:, :, 1]
+        V_patch = patch[:, :, 2]
 
-        # Add a buffer so the threshold isn't uncomfortably tight
-        buffer = np.array([5, 30, 30])
-        min_hsv = np.maximum(min_hsv - buffer, 0).astype(int)
-        max_hsv = np.minimum(max_hsv + buffer, [180, 255, 255]).astype(int)
+        # Calculate Saturation and Value normally
+        min_s, max_s = np.min(S_patch), np.max(S_patch)
+        min_v, max_v = np.min(V_patch), np.max(V_patch)
+
+        # Handle Hue wrap-around (if values exist at both extremes)
+        if np.any(H_patch < 30) and np.any(H_patch > 150):
+            # True lower bound is the min of the HIGH values
+            min_h = np.min(H_patch[H_patch > 90])
+            # True upper bound is the max of the LOW values
+            max_h = np.max(H_patch[H_patch < 90])
+        else:
+            min_h, max_h = np.min(H_patch), np.max(H_patch)
+
+        # Apply buffers
+        buffer_h, buffer_sv = 5, 30
+
+        # S and V clamp between 0 and 255
+        min_s = max(0, int(min_s) - buffer_sv)
+        min_v = max(0, int(min_v) - buffer_sv)
+        max_s = min(255, int(max_s) + buffer_sv)
+        max_v = min(255, int(max_v) + buffer_sv)
+
+        # Hue uses modulo 180 to wrap around safely (e.g., 2 - 5 = 177)
+        min_h = (int(min_h) - buffer_h) % 180
+        max_h = (int(max_h) + buffer_h) % 180
 
         cname = self.active_color
-
-        # Update the UI Trackbars (This will automatically trigger thresh_setter)
         win = f"{cname}_sliders"
+
         try:
-            cv2.setTrackbarPos("H_low", win, int(min_hsv[0]))
-            cv2.setTrackbarPos("S_low", win, int(min_hsv[1]))
-            cv2.setTrackbarPos("V_low", win, int(min_hsv[2]))
-            cv2.setTrackbarPos("H_high", win, int(max_hsv[0]))
-            cv2.setTrackbarPos("S_high", win, int(max_hsv[1]))
-            cv2.setTrackbarPos("V_high", win, int(max_hsv[2]))
+            cv2.setTrackbarPos("H_low", win, min_h)
+            cv2.setTrackbarPos("S_low", win, min_s)
+            cv2.setTrackbarPos("V_low", win, min_v)
+            cv2.setTrackbarPos("H_high", win, max_h)
+            cv2.setTrackbarPos("S_high", win, max_s)
+            cv2.setTrackbarPos("V_high", win, max_v)
             self.get_logger().info(f"Sampled patch! Updated '{cname}' HSV thresholds.")
         except cv2.error:
             self.get_logger().warn(f"Could not update trackbars. Is the {win} window closed?")
@@ -266,8 +287,21 @@ class ColorsTracker(Node):
         centers_xyz = {}
 
         for name, (lo, hi) in self.color_ranges.items():
-            # Initial color threshold
-            m = cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8))
+            # Initial color threshold: Handle Hue wrap-around for Red
+            if lo[0] > hi[0]:
+                # Split into two ranges: lo[0] to 180, and 0 to hi[0]
+                lo1, hi1 = list(lo), list(hi)
+                lo2, hi2 = list(lo), list(hi)
+
+                hi1[0] = 180
+                lo2[0] = 0
+
+                m1 = cv2.inRange(hsv, np.array(lo1, np.uint8), np.array(hi1, np.uint8))
+                m2 = cv2.inRange(hsv, np.array(lo2, np.uint8), np.array(hi2, np.uint8))
+                m = cv2.bitwise_or(m1, m2)
+            else:
+                # Normal continuous range
+                m = cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8))
 
             # Clean with morphology
             m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k, iterations=1)
