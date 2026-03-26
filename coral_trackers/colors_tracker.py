@@ -145,6 +145,12 @@ class ColorsTracker(Node):
             cv2.createTrackbar("S_high", win, hi[1], 255, thresh_setter(cname, 1, 1))
             cv2.createTrackbar("V_high", win, hi[2], 255, thresh_setter(cname, 1, 2))
 
+        self.filtered_xyz = {k: None for k in self.color_ranges.keys()}
+
+        # Hyperparameters
+        self.alpha = 0.2          # Smoothing: 1.0 = no filter, 0.01 = very slow/smooth
+        self.dist_threshold = 0.3 # Max allowed jump in meters between frames
+
         self.K = None    # (fx, fy, cx, cy)
         self.img = None  # last BGR
         self.depth = None # last depth meters
@@ -259,6 +265,27 @@ class ColorsTracker(Node):
             depth_m = d.astype(np.float32)
         self.depth = depth_m
 
+    def update_filtered_position(self, name, new_xyz):
+        """Applies a distance gate and exponential moving average."""
+        if self.filtered_xyz[name] is None:
+            # Initial detection: just accept it
+            self.filtered_xyz[name] = new_xyz
+            return new_xyz
+
+        # Calculate Euclidean distance from last filtered position
+        dist = np.linalg.norm(new_xyz - self.filtered_xyz[name])
+
+        if dist < self.dist_threshold:
+            # Gated Update: Smooth the observation
+            smoothed = (self.alpha * new_xyz) + ((1.0 - self.alpha) * self.filtered_xyz[name])
+            self.filtered_xyz[name] = smoothed
+        else:
+            # Outlier rejected! Object jumped too far.
+            # We keep the old position (coasting through occlusion/noise)
+            self.get_logger().warn(f"Outlier rejected for {name}: {dist:.2f}m jump")
+
+        return self.filtered_xyz[name]
+
     def on_img(self, msg: Image):
         if self.K is None or self.depth is None:
             return
@@ -340,19 +367,22 @@ class ColorsTracker(Node):
                         self.projected_centroid_publishers[name].publish(pt3d)
 
                 # For 3d center in camera frame
-                center_xyz = _mean_xyz_from_mask(m, depth_m, self.K)
-                if center_xyz is not None:
-                    centers_xyz[name] = center_xyz
+                raw_xyz = _mean_xyz_from_mask(m, depth_m, self.K)
+                if raw_xyz is not None:
+                    target_xyz = self.update_filtered_position(name, raw_xyz)
+                    centers_xyz[name] = target_xyz
                     pt = PointStamped()
                     pt.header = msg.header
-                    # Use the RGB optical frame (or whatever your image frame is)
                     if not pt.header.frame_id:
                         pt.header.frame_id = 'camera_color_optical_frame'
-                    pt.point.x = float(center_xyz[0])
-                    pt.point.y = float(center_xyz[1])
-                    pt.point.z = float(center_xyz[2])
+                    pt.point.x = float(target_xyz[0])
+                    pt.point.y = float(target_xyz[1])
+                    pt.point.z = float(target_xyz[2])
                     self.center_publishers[name].publish(pt)
                 else:
+                    # If the mask is empty/invalid, we don't update self.filtered_xyz.
+                    # This allows the tracker to "freeze" at the last known spot
+                    # rather than jumping to (0,0,0).
                     self.get_logger().debug(f"No valid depth for {name} blob")
 
                 # publish mask
