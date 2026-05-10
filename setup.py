@@ -33,6 +33,7 @@ setup(
             'samurai_tracker = coral_trackers.samurai_tracker:main',
             'bbox_selector = coral_trackers.bbox_selector:main',
             'mask_center_tracker = coral_trackers.mask_center_tracker:main',
+            'foundation_pose_tracker = coral_trackers.foundation_pose_tracker:main',
             'foundation_pose_plus_plus_tracker = coral_trackers.foundation_pose_plus_plus_tracker:main',
         ],
     },
