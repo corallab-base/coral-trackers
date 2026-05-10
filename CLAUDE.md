@@ -37,7 +37,8 @@ Four production nodes handle different tracking modalities:
 | `samurai_tracker` | `samurai_tracker.py` | SAM2 2D segmentation tracking |
 | `bbox_selector` | `bbox_selector.py` | Interactive bounding box selection tool |
 | `mask_center_tracker` | `mask_center_tracker.py` | Filtered 3D center from mask + depth |
-| `foundationpose_plus_plus_tracker` | `foundation_pose_plus_plus_tracker.py` | 6DOF pose estimation |
+| `foundation_pose_tracker` | `foundation_pose_tracker.py` | FoundationPose: register() once, track_one() every frame |
+| `foundationpose_plus_plus_tracker` | `foundation_pose_plus_plus_tracker.py` | 6DOF pose estimation with mask-center anchoring and optional Kalman filter |
 
 A shared utility lives in `utils/kalman_filter_6d.py`.
 
@@ -72,6 +73,10 @@ Publishes: `{bbox_topic}` (default `obj/bbox`, RegionOfInterest). Press **S** to
 **`mask_center_tracker`** (subscribes): `{object_name}_mask` (mono8), `{depth_topic}` (default `depth`), `{camera_info_topic}` (default `camera_info`)  
 Publishes: `{object_name}/center` (PointStamped, filtered 3D camera-frame XYZ)
 
+**`foundation_pose_tracker`** (subscribes): `image`, `depth`, `camera_info`, `{name}_mask` (mono8)  
+Publishes: `{name}/pose` (PoseStamped), `{name}/pose_viz` (annotated image, optional)  
+Parameters: `register_iter` (default 5), `track_refine_iter` (default 4)
+
 **`foundation_pose_plus_plus_tracker`** (subscribes): `image`, `depth`, `camera_info`, `{name}/center`  
 Publishes: `{name}/pose` (PoseStamped), `{name}/pose_viz` (annotated image, optional)
 
@@ -90,5 +95,6 @@ Set these before running if the defaults don't match your environment.
 - **Distance-gated EMA filter** (`colors_tracker`): Large jumps (> `dist_threshold` meters) are rejected as outliers. After 90 consecutive rejections the gate resets, allowing a genuine object relocation to be accepted.
 - **SAM2 streaming inference** (`samurai_tracker`): On the first bbox, `init_state(frames=[frame])` is called with a single frame, `add_new_points_or_box` seeds it, and `propagate_in_video` runs on that one frame to establish the conditioning memory. Every subsequent frame calls `predictor.track_new_frame(state, frame_np)` — a method added to `SAM2VideoPredictor` (`~/phd/software/samurai/sam2/sam2/sam2_video_predictor.py`) that appends the frame to `inference_state["images"]` and calls `_run_single_frame_inference` directly, returning a mask without re-initializing state. Raw frame tensors are freed after feature extraction. A new bbox resets `_state = None` and triggers re-initialization on the next frame.
 - **Mask-based 3D center** (`mask_center_tracker`): Back-projects every mask pixel to 3D using per-pixel depth and intrinsics, rejects depth outliers via median absolute deviation (MAD) to discard mixed foreground/background readings at mask edges, then applies a distance-gated EMA filter before publishing. Parameters: `alpha` (EMA weight, default 0.3), `dist_threshold` (outlier gate in metres, default 0.3).
+- **Standard FoundationPose** (`foundation_pose_tracker`): Calls `register()` once on the first received mask (hypothesis generation + scoring), then `track_one()` every depth frame thereafter. No KalmanFilter, no `mask_center_tracker` dependency — the simplest pipeline when you just need reliable 6DOF pose. A new mask (via `{name}_mask`) re-runs `register()` to reinitialize.
 - **FoundationPose++ init** (`foundation_pose_plus_plus_tracker`): Skips the expensive `register()` call. Waits for the first `{name}/center` message from `mask_center_tracker` and uses it directly as the initial XYZ translation, then refines with `track_one`. Each subsequent frame anchors the pose translation to the latest center before refinement. An optional `KalmanFilter6D` smooths the rotation; its translation state is overridden by the mask center each frame.
 - **QoS**: Camera subscriptions use `BEST_EFFORT` reliability + `KEEP_LAST` to tolerate dropped frames from real-time sensors.
