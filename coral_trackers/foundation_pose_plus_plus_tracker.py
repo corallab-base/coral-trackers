@@ -25,10 +25,7 @@ _fp_ros_path = os.environ.get(
 if _fp_ros_path not in sys.path:
     sys.path.append(_fp_ros_path)
 
-_fp_path = os.environ.get(
-    'FOUNDATIONPOSE_PATH',
-    '/home/tassos/phd/research/demos/goc_demo_workspace/src/FoundationPoseROS2/FoundationPose',
-)
+_fp_path = os.path.join(_fp_ros_path, "FoundationPose")
 if _fp_path not in sys.path:
     sys.path.append(_fp_path)
 
