@@ -30,6 +30,7 @@ setup(
     entry_points={
         'console_scripts': [
             'colors_tracker = coral_trackers.colors_tracker:main',
+            'samurai_tracker = coral_trackers.samurai_tracker:main',
         ],
     },
 )
