@@ -31,6 +31,7 @@ setup(
         'console_scripts': [
             'colors_tracker = coral_trackers.colors_tracker:main',
             'samurai_tracker = coral_trackers.samurai_tracker:main',
+            'bbox_selector = coral_trackers.bbox_selector:main',
         ],
     },
 )
