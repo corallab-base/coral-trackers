@@ -146,6 +146,7 @@ class ColorsTracker(Node):
             cv2.createTrackbar("V_high", win, hi[2], 255, thresh_setter(cname, 1, 2))
 
         self.filtered_xyz = {k: None for k in self.color_ranges.keys()}
+        self.filter_gate_count = {k: 0 for k in self.color_ranges.keys()}
 
         # Hyperparameters
         self.alpha = 0.2          # Smoothing: 1.0 = no filter, 0.01 = very slow/smooth
@@ -275,14 +276,16 @@ class ColorsTracker(Node):
         # Calculate Euclidean distance from last filtered position
         dist = np.linalg.norm(new_xyz - self.filtered_xyz[name])
 
-        if dist < self.dist_threshold:
+        if dist < self.dist_threshold or self.filter_gate_count[name] > 90:
             # Gated Update: Smooth the observation
             smoothed = (self.alpha * new_xyz) + ((1.0 - self.alpha) * self.filtered_xyz[name])
             self.filtered_xyz[name] = smoothed
+            self.filter_gate_count[name] = 0
         else:
             # Outlier rejected! Object jumped too far.
             # We keep the old position (coasting through occlusion/noise)
             self.get_logger().warn(f"Outlier rejected for {name}: {dist:.2f}m jump")
+            self.filter_gate_count[name] += 1
 
         return self.filtered_xyz[name]
 
@@ -396,6 +399,12 @@ class ColorsTracker(Node):
         self.masks = masks
         self.mask_all = None
 
+    def _reset_filters(self):
+        self.get_logger().info("resetting filters!")
+        for name in self.color_ranges.keys():
+            self.filtered_xyz[name] = None
+
+
     # ---- UI loop & key handling ----
     def render(self):
         if not getattr(self, "masks", None) or len(self.masks) == 0:
@@ -466,6 +475,8 @@ class ColorsTracker(Node):
             idx = colors.index(self.active_color)
             self.active_color = colors[(idx + 1) % len(colors)]
             self.get_logger().info(f"Switched active tuning color to: {self.active_color}")
+        elif key == ord('r'):
+            self._reset_filters()
 
 def main():
     rclpy.init()
