@@ -32,6 +32,7 @@ setup(
             'colors_tracker = coral_trackers.colors_tracker:main',
             'samurai_tracker = coral_trackers.samurai_tracker:main',
             'bbox_selector = coral_trackers.bbox_selector:main',
+            'mask_center_tracker = coral_trackers.mask_center_tracker:main',
         ],
     },
 )
