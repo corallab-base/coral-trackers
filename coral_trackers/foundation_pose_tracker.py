@@ -136,7 +136,7 @@ class FoundationPoseTrackerNode(Node):
         self.mask_subs = {}
         for name in self.objects:
             self.mask_subs[name] = self.create_subscription(
-                Image, f'{name}_mask',
+                Image, f'{name}/mask',
                 lambda msg, n=name: self._on_mask(n, msg), 10,
             )
 

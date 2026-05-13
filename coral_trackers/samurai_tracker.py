@@ -80,7 +80,7 @@ class SamuraiTrackerNode(Node):
         self._pub_centroid = self.create_publisher(
             PointStamped, f'{self._object_name}_centroid', 10)
         self._pub_mask = (
-            self.create_publisher(Image, f'{self._object_name}_mask', 10)
+            self.create_publisher(Image, f'{self._object_name}/mask', 10)
             if self._publish_mask else None
         )
 

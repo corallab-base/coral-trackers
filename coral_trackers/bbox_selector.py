@@ -3,6 +3,7 @@ import threading
 
 import cv2
 from cv_bridge import CvBridge
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -13,16 +14,18 @@ _HINT = "Press 'S' to select bbox, 'Q' to quit"
 
 
 class BboxSelectorNode(Node):
-    """ROS 2 node: display live image and publish a user-drawn bounding box."""
+    """ROS 2 node: display live image, publish a user-drawn bounding box and its binary mask."""
 
     def __init__(self):
         super().__init__('bbox_selector')
 
         self.declare_parameter('image_topic', 'image')
-        self.declare_parameter('bbox_topic', 'obj/bbox')
+        self.declare_parameter('obj_name', 'obj')
 
         image_topic = self.get_parameter('image_topic').value
-        self._bbox_topic = self.get_parameter('bbox_topic').value
+        obj_name = self.get_parameter('obj_name').value
+        self._bbox_topic = f'{obj_name}/bbox'
+        self._mask_topic = f'{obj_name}/mask'
 
         self._bridge = CvBridge()
         self._latest_frame = None
@@ -36,10 +39,11 @@ class BboxSelectorNode(Node):
         )
         self.create_subscription(Image, image_topic, self._image_callback, sensor_qos)
         self._pub_bbox = self.create_publisher(RegionOfInterest, self._bbox_topic, 10)
+        self._pub_mask = self.create_publisher(Image, self._mask_topic, 10)
 
         self.get_logger().info(
             f"Subscribed to '{image_topic}'. "
-            f"Publishing bbox on '{self._bbox_topic}'.")
+            f"Publishing bbox on '{self._bbox_topic}', mask on '{self._mask_topic}'.")
 
     def _image_callback(self, msg: Image):
         frame = self._bridge.imgmsg_to_cv2(msg, 'bgr8')
@@ -52,7 +56,7 @@ class BboxSelectorNode(Node):
             return None if self._latest_frame is None else self._latest_frame.copy()
 
     def publish_bbox(self, x: int, y: int, w: int, h: int):
-        """Publish a RegionOfInterest and cache it for overlay display."""
+        """Publish a RegionOfInterest, a binary mask image, and cache bbox for overlay."""
         msg = RegionOfInterest()
         msg.x_offset = x
         msg.y_offset = y
@@ -61,6 +65,15 @@ class BboxSelectorNode(Node):
         self._pub_bbox.publish(msg)
         self.last_bbox = (x, y, w, h)
         self.get_logger().info(f'Bbox published: ({x}, {y}, {w}x{h})')
+
+        frame = self.latest_frame()
+        if frame is not None:
+            h_img, w_img = frame.shape[:2]
+            mask = np.zeros((h_img, w_img), dtype=np.uint8)
+            mask[y:y + h, x:x + w] = 255
+            mask_msg = self._bridge.cv2_to_imgmsg(mask, encoding='mono8')
+            self._pub_mask.publish(mask_msg)
+            self.get_logger().info(f'Mask published to {self._mask_topic}')
 
 
 def main():
