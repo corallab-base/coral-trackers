@@ -1,0 +1,18 @@
+* Usage
+
+** FoundationPose
+
+#+begin_src shell
+source ./trackers-venv/bin/activate
+ros2 run coral_trackers foundation_pose_tracker --ros-args \
+     -p rgb_topic:=/camera/camera/color/image_raw \
+     -p depth_topic:=/camera/camera/aligned_depth_to_color/image_raw \
+     -p camera_info_topic:=/camera/camera/aligned_depth_to_color/camera_info \
+     -p mesh_file_path:=/home/tassos/phd/data/ycb/003_cracker_box_google_16k/003_cracker_box/google_16k/textured.obj \
+     -p objects:=[cheezit]
+#+end_src
+
+
+And to initialize the tracker with an object mask:
+
+: ros2 run coral_trackers bbox_selector --ros-args -p image_topic:=/camera/camera/color/image_raw -p obj_name:=cheezit
