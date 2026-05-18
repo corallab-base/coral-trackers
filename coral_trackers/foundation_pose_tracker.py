@@ -141,9 +141,11 @@ class FoundationPoseTrackerNode(Node):
             )
 
         self.pose_pubs: Dict[str, rclpy.publisher.Publisher] = {}
+        self.center_pose_pubs: Dict[str, rclpy.publisher.Publisher] = {}
         self.viz_pubs: Dict[str, rclpy.publisher.Publisher] = {}
         for name in self.objects:
             self.pose_pubs[name] = self.create_publisher(PoseStamped, f'{name}/pose', 10)
+            self.center_pose_pubs[name] = self.create_publisher(PoseStamped, f'{name}/center_pose', 10)
             if self.publish_viz:
                 self.viz_pubs[name] = self.create_publisher(Image, f'{name}/pose_viz', 10)
 
@@ -208,10 +210,10 @@ class FoundationPoseTrackerNode(Node):
                     self.get_logger().error(f"track_one() failed for '{name}': {e}")
                     continue
 
-            self._publish_pose(name, pose, header)
+            center_pose = pose @ np.linalg.inv(st.to_origin)
+            self._publish_poses(name, pose, center_pose, header)
 
             if st.viz_enable and name in self.viz_pubs:
-                center_pose = pose @ np.linalg.inv(st.to_origin)
                 vis = draw_posed_3d_box(self.K, img=self.rgb.copy(),
                                         ob_in_cam=center_pose, bbox=st.bbox)
                 vis = draw_xyz_axis(vis, ob_in_cam=center_pose, scale=0.1, K=self.K,
@@ -223,7 +225,7 @@ class FoundationPoseTrackerNode(Node):
 
         torch.cuda.empty_cache()
 
-    def _publish_pose(self, name: str, T: np.ndarray, header):
+    def _publish_poses(self, name: str, T: np.ndarray, center_T: np.ndarray, header):
         msg = PoseStamped()
         msg.header = header
         msg.header.frame_id = header.frame_id or 'camera_color_optical_frame'
@@ -236,6 +238,20 @@ class FoundationPoseTrackerNode(Node):
         msg.pose.orientation.z = float(q[2])
         msg.pose.orientation.w = float(q[3])
         self.pose_pubs[name].publish(msg)
+
+        center_msg = PoseStamped()
+        center_msg.header = header
+        center_msg.header.frame_id = header.frame_id or 'camera_color_optical_frame'
+        center_q = Rotation.from_matrix(center_T[:3, :3]).as_quat()
+        center_msg.pose.position.x = float(center_T[0, 3])
+        center_msg.pose.position.y = float(center_T[1, 3])
+        center_msg.pose.position.z = float(center_T[2, 3])
+        center_msg.pose.orientation.x = float(center_q[0])
+        center_msg.pose.orientation.y = float(center_q[1])
+        center_msg.pose.orientation.z = float(center_q[2])
+        center_msg.pose.orientation.w = float(center_q[3])
+        self.center_pose_pubs[name].publish(center_msg)
+
 
 
 def main():
